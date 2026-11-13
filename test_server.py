@@ -63,6 +63,27 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(server.verify_password(self.ADMIN_PASSWORD,user["password"]))
         self.assertTrue(user["must_change_pass"])
 
+    def test_postgresql_compatibility_adapter_translates_types_and_parameters(self):
+        class FakeConnection:
+            def __init__(self):
+                self.statements=[]
+            def execute(self,statement,parameters=()):
+                self.statements.append((statement,parameters))
+            def commit(self): pass
+            def rollback(self): pass
+            def close(self): pass
+
+        raw=FakeConnection()
+        db=server.PostgreSQLConnection(raw)
+        db.execute("CREATE TABLE files (id INTEGER PRIMARY KEY AUTOINCREMENT, content BLOB NOT NULL)")
+        db.execute("SELECT id FROM files WHERE id=?",(9,))
+        db.execute("BEGIN IMMEDIATE")
+        self.assertIn("BIGSERIAL PRIMARY KEY",raw.statements[0][0])
+        self.assertIn("BYTEA",raw.statements[0][0])
+        self.assertEqual(raw.statements[1],("SELECT id FROM files WHERE id=%s",(9,)))
+        self.assertEqual(raw.statements[2],("LOCK TABLE app_tables IN EXCLUSIVE MODE",()))
+        self.assertEqual(len(raw.statements),3)
+
     def test_temporary_password_cannot_read_private_tables(self):
         self.login()
         with self.assertRaises(HTTPError) as error:
@@ -171,6 +192,19 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             self.request("POST","/api/applications",{},opener=build_opener(),headers={"Origin":"https://attacker.invalid"})
         self.assertEqual(error.exception.code,403)
+
+    def test_configured_vercel_origin_can_submit_applications(self):
+        allowed_origin="https://acms-portal.vercel.app"
+        previous=server.ALLOWED_ORIGINS
+        server.ALLOWED_ORIGINS=set(previous)|{allowed_origin}
+        try:
+            status,_,_=self.request("POST","/api/applications",{
+                "fn":"Vercel","ln":"Applicant","email":"vercel@example.test","phone":"+256700000066",
+                "dept_id":1,"prog_name":"BSc Computer Science",
+            },opener=build_opener(),headers={"Origin":allowed_origin})
+            self.assertEqual(status,201)
+        finally:
+            server.ALLOWED_ORIGINS=previous
 
     def test_security_headers_are_set_on_app_response(self):
         with urlopen(self.base+"/") as response:

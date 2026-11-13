@@ -14,6 +14,7 @@ import binascii
 import mimetypes
 import secrets
 import sqlite3
+import threading
 import time
 import zipfile
 from xml.sax.saxutils import escape as xml_escape
@@ -26,12 +27,42 @@ from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("NUU_DB_PATH", ROOT / "data" / "nuu.sqlite3"))
+DATABASE_URL = os.environ.get("DATABASE_URL")
 MAX_BODY = 12 * 1024 * 1024
 MAX_UPLOAD = 8 * 1024 * 1024
 SESSION_SECONDS = 8 * 60 * 60
 PBKDF2_ROUNDS = 310_000
 COOKIE_SECURE = os.environ.get("NUU_COOKIE_SECURE", "0") == "1"
+ALLOWED_ORIGINS = {origin.strip().rstrip("/").casefold() for origin in os.environ.get("NUU_ALLOWED_ORIGINS", "").split(",") if origin.strip()}
 DUMMY_PASSWORD_HASH = None
+POSTGRES_SCHEMA_READY = False
+POSTGRES_SCHEMA_LOCK = threading.Lock()
+
+
+class PostgreSQLConnection:
+    """Small SQL compatibility wrapper for the app's SQLite/PostgreSQL queries."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, statement, parameters=()):
+        if statement == "BEGIN IMMEDIATE":
+            # Serialize the JSON-table read/modify/write flow that SQLite locks here.
+            return self.connection.execute("LOCK TABLE app_tables IN EXCLUSIVE MODE")
+        statement = statement.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+        statement = re.sub(r"\bBLOB\b", "BYTEA", statement, flags=re.IGNORECASE)
+        statement = statement.replace("?", "%s")
+        return self.connection.execute(statement, parameters)
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
+
 
 TABLES = (
     "roles departments programs users courses hostels settings audit_logs announcements notifications "
@@ -82,6 +113,40 @@ DUMMY_PASSWORD_HASH = password_hash(secrets.token_urlsafe(24))
 
 @contextmanager
 def connect():
+    if DATABASE_URL:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as error:
+            raise RuntimeError("Install the requirements.txt dependencies to use PostgreSQL.") from error
+
+        raw_db = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        db = PostgreSQLConnection(raw_db)
+        schema_statements = (
+            "CREATE TABLE IF NOT EXISTS app_tables (name TEXT PRIMARY KEY, rows TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS uploads (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, assignment_id INTEGER NOT NULL, filename TEXT NOT NULL, media_type TEXT NOT NULL, content BLOB NOT NULL, created_at TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS application_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, application_id INTEGER NOT NULL, filename TEXT NOT NULL, media_type TEXT NOT NULL, content BLOB NOT NULL, created_at TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS student_sequences (department_id INTEGER PRIMARY KEY, last_number INTEGER NOT NULL)",
+        )
+        try:
+            global POSTGRES_SCHEMA_READY
+            if not POSTGRES_SCHEMA_READY:
+                with POSTGRES_SCHEMA_LOCK:
+                    if not POSTGRES_SCHEMA_READY:
+                        for statement in schema_statements:
+                            db.execute(statement)
+                        db.commit()
+                        POSTGRES_SCHEMA_READY = True
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        return
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB_PATH, timeout=15)
     db.row_factory = sqlite3.Row
@@ -104,7 +169,7 @@ def connect():
 
 def read_table(db, name):
     row = db.execute("SELECT rows FROM app_tables WHERE name=?", (name,)).fetchone()
-    return json.loads(row[0]) if row else []
+    return json.loads(row["rows"]) if row else []
 
 
 def write_table(db, name, rows):
@@ -168,7 +233,7 @@ def seed_database(bootstrap_password=None):
         "settings":settings,"audit_logs":[],"announcements":[],"notifications":[],"registrations":[],"results":[],"fee_payments":[],"assignments":[],"hostel_allocations":[],"students":[],"messages":[],"books":[],"applications":[],"submissions":[],
     }
     with connect() as db:
-        existing = {row[0] for row in db.execute("SELECT name FROM app_tables")}
+        existing = {row["name"] for row in db.execute("SELECT name FROM app_tables")}
         existing_users=read_table(db,"users") if "users" in existing else []
         created_admin=not existing_users
         if created_admin and len(bootstrap_password)<10:
@@ -294,7 +359,8 @@ class Handler(BaseHTTPRequestHandler):
         if not origin:
             return True
         parsed=urlparse(origin)
-        allowed=bool(parsed.scheme in {"http","https"} and parsed.netloc and parsed.netloc.casefold()==self.headers.get("Host","").casefold() and parsed.path=="" and not parsed.query and not parsed.fragment)
+        origin_host=parsed.netloc.casefold()
+        allowed=bool(parsed.scheme in {"http","https"} and parsed.netloc and parsed.path=="" and not parsed.query and not parsed.fragment and (origin_host==self.headers.get("Host","").casefold() or f"{parsed.scheme}://{origin_host}".casefold() in ALLOWED_ORIGINS))
         if not allowed:
             self.respond(403,{"error":"Cross-origin requests are not allowed."})
         return allowed
@@ -570,8 +636,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.respond(409,{"error":"A submission already exists for this assignment."})
                         return
                     mime=mimetypes.guess_type(filename)[0] or "application/octet-stream"
-                    cursor=db.execute("INSERT INTO uploads(owner_id,assignment_id,filename,media_type,content,created_at) VALUES(?,?,?,?,?,?)",(user["id"],assignment_id,filename,mime,content,datetime.now(timezone.utc).isoformat()))
-                    uploads_id=cursor.lastrowid
+                    cursor=db.execute("INSERT INTO uploads(owner_id,assignment_id,filename,media_type,content,created_at) VALUES(?,?,?,?,?,?) RETURNING id",(user["id"],assignment_id,filename,mime,content,datetime.now(timezone.utc).isoformat()))
+                    uploads_id=cursor.fetchone()["id"]
                     rows=read_table(db,"submissions")
                     row={"id":max([r["id"] for r in rows],default=0)+1,"assignment_id":assignment_id,"student_id":student["id"],"upload_id":uploads_id,"file_name":filename,"comments":str(data.get("comments",""))[:1000],"submitted_at":datetime.now(timezone.utc).isoformat()}
                     rows.append(row)
@@ -690,8 +756,8 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     for filename,content,media_type in decoded_credentials:
                         uploaded=datetime.now(timezone.utc).isoformat()
-                        cursor=db.execute("INSERT INTO application_documents(application_id,filename,media_type,content,created_at) VALUES(?,?,?,?,?)",(row["id"],filename,media_type,content,uploaded))
-                        row["documents"].append({"id":cursor.lastrowid,"filename":filename,"uploaded_at":uploaded})
+                        cursor=db.execute("INSERT INTO application_documents(application_id,filename,media_type,content,created_at) VALUES(?,?,?,?,?) RETURNING id",(row["id"],filename,media_type,content,uploaded))
+                        row["documents"].append({"id":cursor.fetchone()["id"],"filename":filename,"uploaded_at":uploaded})
                     rows.append(row)
                     write_table(db,"applications",rows)
                 self.respond(201,{"id":row["id"]})
@@ -1161,9 +1227,9 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     bootstrap=seed_database()
     host=os.environ.get("NUU_HOST","127.0.0.1")
-    port=int(os.environ.get("NUU_PORT","8000"))
+    port=int(os.environ.get("PORT",os.environ.get("NUU_PORT","8000")))
     server=ThreadingHTTPServer((host,port),Handler)
-    print(f"NUU server running at http://{host}:{port} (SQLite: {DB_PATH})")
+    print(f"ACMS server running at http://{host}:{port} ({'Neon PostgreSQL' if DATABASE_URL else f'SQLite: {DB_PATH}'})")
     if bootstrap:
         print(f"Initial admin login — username: {bootstrap['username']}  password: {bootstrap['password']}")
         print("Change this temporary password at first sign-in. Save it securely; it is shown only during initial setup.")

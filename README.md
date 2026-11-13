@@ -1,6 +1,6 @@
 # AFRICAN ARK COLLEGE OF MANAGEMENT SCIENCES Management System
 
-NUU runs on the existing single-page portal, a Python standard-library HTTP server, and SQLite. It does not install Python packages or a database service on the host. Accounts, sessions, role checks, student-specific access, record writes, admissions, and assignment files are handled by the server.
+ACMS runs as a single-page HTML/CSS/vanilla JavaScript frontend and a Python HTTP API. Local development uses Python's standard-library HTTP server and SQLite. Production can use the same API with Neon PostgreSQL by setting `DATABASE_URL`; `requirements.txt` installs the PostgreSQL driver. Accounts, sessions, role checks, student-specific access, admissions, and uploaded documents are handled by the API.
 
 ## Local run
 
@@ -43,6 +43,18 @@ caddy run --config .\Caddyfile --adapter caddyfile
 ```
 
 Replace `ums.example.org` with your actual domain. Caddy terminates HTTPS and forwards to the loopback-only Python listener. NUU sets secure, HttpOnly, SameSite session cookies in this mode. Keep the Python port off the public firewall. For an always-on host, run both processes under dedicated, least-privilege service accounts and configure them to start on boot.
+
+## Render + Neon + Vercel deployment
+
+The deployment is split into three services: Vercel serves the static frontend, Vercel rewrites `/api/*` requests to the Python service on Render, and the Render API stores data in Neon PostgreSQL. The repository includes `render.yaml`, `vercel.json`, and a small Vercel static build script.
+
+1. **Create Neon PostgreSQL.** Create a Neon project and copy its PostgreSQL connection string (include `sslmode=require`). Keep the connection string private.
+2. **Deploy the API to Render.** In Render, create a Blueprint from this repository and provide the requested `DATABASE_URL` and `NUU_ALLOWED_ORIGINS` values. The Blueprint runs `python server.py`, binds to `0.0.0.0`, uses Render's `PORT`, enables secure cookies, and generates an initial `NUU_ADMIN_PASSWORD`.
+3. **Deploy the frontend to Vercel.** Import the same repository with the repository root as the project root and the `Other` framework preset. `vercel.json` builds the static `dist` folder and proxies API paths to `https://acms-api.onrender.com`. If Render assigns the API a different URL, update the rewrite destination in `vercel.json` and redeploy Vercel.
+4. **Set the allowed frontend origin.** In Render, set `NUU_ALLOWED_ORIGINS` to the exact Vercel origin, for example `https://your-project.vercel.app`. Add any custom domain as another comma-separated origin. Redeploy the API after changing it.
+5. **Complete the first sign-in.** Read the generated `NUU_ADMIN_PASSWORD` from the Render environment settings and sign in as `admin`. Change the temporary password after signing in.
+
+`DATABASE_URL` switches the API from local SQLite to PostgreSQL. A fresh Neon database is initialized automatically. Existing records in a local `data/nuu.sqlite3` file are **not** transferred automatically. Use one Render API instance with this application. For production backups, use Neon backup/PITR facilities; `backup.py` is for local SQLite databases.
 
 ## Backups and restore
 
