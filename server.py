@@ -47,7 +47,16 @@ ALLOWED_ORIGINS = {origin.strip().rstrip("/").casefold() for origin in os.enviro
 DUMMY_PASSWORD_HASH = None
 
 
-def restore_vercel_api_path(request_path: str) -> str:
+def restore_vercel_api_path(request_path: str, original_path: str | None = None) -> str:
+    if original_path:
+        original = urlsplit(original_path)
+        if (
+            not original.scheme
+            and not original.netloc
+            and not original.fragment
+            and (original.path == "/api" or original.path.startswith("/api/"))
+        ):
+            return original.path + ("?" + original.query if original.query else "")
     parsed = urlsplit(request_path)
     if parsed.path != "/api/router":
         return request_path

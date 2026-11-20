@@ -11,7 +11,10 @@ server.seed_database()
 
 class handler(server.Handler):
     def _restore_rewritten_path(self):
-        self.path = server.restore_vercel_api_path(self.path)
+        self.path = server.restore_vercel_api_path(
+            self.path,
+            self.headers.get("x-nuu-original-path"),
+        )
 
     def do_GET(self):
         self._restore_rewritten_path()

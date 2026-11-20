@@ -99,7 +99,14 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status,200)
         self.assertEqual(payload,{"auth_url":"https://auth.example.test/db/auth"})
 
-    def test_vercel_rewrite_restores_api_path_and_preserves_original_query(self):
+    def test_vercel_rewrite_restores_original_path_header_and_preserves_query(self):
+        self.assertEqual(
+            server.restore_vercel_api_path(
+                "/api/router",
+                "/api/auth/config?lang=en",
+            ),
+            "/api/auth/config?lang=en",
+        )
         self.assertEqual(
             server.restore_vercel_api_path("/api/router?nuu_path=%2Fauth%2Fconfig&lang=en"),
             "/api/auth/config?lang=en",
