@@ -4,13 +4,18 @@ import io
 import json
 from contextlib import contextmanager
 import threading
+import time
 import unittest
+import uuid
 import zipfile
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 from unittest.mock import patch
+from types import SimpleNamespace
 
+import jwt
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import server
 
 
@@ -29,12 +34,21 @@ class ServerTests(unittest.TestCase):
         cls.httpd.server_close()
 
     def setUp(self):
+        self.config_patches = [
+            patch.object(server,"DATABASE_URL",None),
+            patch.object(server,"NEON_AUTH_BASE_URL",""),
+            patch.object(server,"NEON_AUTH_JWKS_URL",""),
+            patch.object(server,"NEON_AUTH_JWKS_CLIENT",None),
+        ]
+        for config_patch in self.config_patches:
+            config_patch.start()
         server.reset_store()
         server.seed_database(bootstrap_password=self.ADMIN_PASSWORD)
         self.opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
     def tearDown(self):
-        pass
+        for config_patch in reversed(self.config_patches):
+            config_patch.stop()
 
     def request(self, method, path, data=None, opener=None, headers=None):
         body = None if data is None else json.dumps(data).encode()
@@ -78,6 +92,39 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status,200)
         self.assertEqual(payload["storage"],"postgresql")
         self.assertTrue(payload["persistent"])
+
+    def test_auth_config_returns_only_public_auth_url(self):
+        with patch.object(server,"NEON_AUTH_BASE_URL","https://auth.example.test/db/auth"):
+            status,payload,_=self.request("GET","/api/auth/config")
+        self.assertEqual(status,200)
+        self.assertEqual(payload,{"auth_url":"https://auth.example.test/db/auth"})
+
+    def test_legacy_password_login_is_disabled_when_neon_auth_is_configured(self):
+        with patch.object(server,"NEON_AUTH_BASE_URL","https://auth.example.test/db/auth"):
+            with self.assertRaises(HTTPError) as error:
+                self.login()
+        self.assertEqual(error.exception.code,410)
+
+    def test_neon_auth_token_requires_valid_ed25519_signature_and_audience(self):
+        private_key=Ed25519PrivateKey.generate()
+        auth_origin="https://auth.example.test"
+        token=jwt.encode(
+            {
+                "iss":auth_origin,"aud":auth_origin,"sub":str(uuid.uuid4()),
+                "role":"authenticated","iat":int(time.time()),"exp":int(time.time())+60,
+            },
+            private_key,
+            algorithm="EdDSA",
+        )
+
+        class FakeJwksClient:
+            def get_signing_key_from_jwt(self, _token):
+                return SimpleNamespace(key=private_key.public_key())
+
+        with patch.object(server,"NEON_AUTH_BASE_URL",auth_origin+"/db/auth"), patch.object(server,"NEON_AUTH_JWKS_CLIENT",FakeJwksClient()):
+            claims=server.verify_neon_auth_token(token)
+        self.assertEqual(claims["role"],"authenticated")
+        self.assertEqual(claims["iss"],auth_origin)
 
     def test_temporary_password_cannot_read_private_tables(self):
         self.login()

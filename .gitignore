@@ -6,3 +6,8 @@ data/
 *.sqlite3-wal
 .vercel/
 dist/
+.env
+.env.*
+!.env.example
+node_modules/
+.neon

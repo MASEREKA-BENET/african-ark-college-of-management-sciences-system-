@@ -157,6 +157,16 @@ body {
   font-size: 13px; color: var(--red); margin-bottom: 18px;
   display: none;
 }
+.auth-status {
+  background: #eaf3ff; border-left: 4px solid var(--blue);
+  border-radius: 0 8px 8px 0; padding: 11px 14px;
+  font-size: 13px; color: var(--navy-2); margin-bottom: 18px;
+}
+.auth-switch {
+  border: 0; background: none; color: var(--blue);
+  font: inherit; font-size: 13px; font-weight: 700;
+  cursor: pointer; text-decoration: underline;
+}
 .fgroup { margin-bottom: 18px; }
 .fgroup label {
   display: block; font-size: 12px; font-weight: 700;
@@ -717,14 +727,15 @@ input, select, textarea, button { max-width: 100%; }
   <div class="login-right">
     <div class="login-badge">🏛️ AFRICAN ARK COLLEGE OF MANAGEMENT SCIENCES Staff &amp; Student Portal</div>
     <h2>Sign In</h2>
-    <p class="login-sub">Enter your credentials to access your portal</p>
-    <div class="login-error" id="loginError">⛔ Invalid username or password.</div>
-    <form onsubmit="doLogin(event)">
+    <p class="login-sub">Sign in with your Neon Auth email and password</p>
+    <div class="login-error" id="loginError" role="alert"></div>
+    <div class="auth-status" id="authStatus" role="status" aria-live="polite" hidden></div>
+    <button class="btn btn-outline btn-xs" id="authSignOut" type="button" onclick="doLogout()" hidden>Sign out</button>
+    <form id="loginForm" onsubmit="doLogin(event)">
       <div class="fgroup">
-        <label for="lu">Username</label>
+        <label for="lu">Email</label>
         <div class="finput-wrap">
-          <span class="finput-icon">👤</span>
-          <input id="lu" type="text" placeholder="Enter username" required autocomplete="username">
+          <input id="lu" type="email" placeholder="Enter your email" required autocomplete="username">
         </div>
       </div>
       <div class="fgroup" style="margin-bottom:24px;">
@@ -737,8 +748,45 @@ input, select, textarea, button { max-width: 100%; }
       </div>
       <button class="btn-login" type="submit">Sign In</button>
     </form>
+    <form id="signupForm" onsubmit="doSignUp(event)" hidden>
+      <div class="fgroup">
+        <label for="suName">Full name</label>
+        <div class="finput-wrap">
+          <input id="suName" type="text" placeholder="Enter your full name" required autocomplete="name" maxlength="120">
+        </div>
+      </div>
+      <div class="fgroup">
+        <label for="suEmail">Email</label>
+        <div class="finput-wrap">
+          <input id="suEmail" type="email" placeholder="Enter your email" required autocomplete="email">
+        </div>
+      </div>
+      <div class="fgroup" style="margin-bottom:24px;">
+        <label for="suPassword">Password</label>
+        <div class="finput-wrap">
+          <input id="suPassword" type="password" placeholder="At least 10 characters" required minlength="10" autocomplete="new-password">
+        </div>
+      </div>
+      <button class="btn-login" type="submit">Create account</button>
+    </form>
+    <form id="verificationForm" onsubmit="verifyNeonEmail(event)" hidden>
+      <div class="fgroup">
+        <label for="verificationEmail">Email</label>
+        <input id="verificationEmail" type="email" class="form-control" readonly>
+      </div>
+      <div class="fgroup">
+        <label for="verificationCode">Email verification code</label>
+        <input id="verificationCode" type="text" class="form-control" required inputmode="numeric" autocomplete="one-time-code" maxlength="8">
+      </div>
+      <button class="btn-login" type="submit">Verify email</button>
+      <div style="text-align:center;margin-top:12px;">
+        <button class="auth-switch" type="button" onclick="resendNeonVerification()">Resend code</button>
+        <button class="auth-switch" type="button" onclick="showLoginForm()">Back to sign in</button>
+      </div>
+    </form>
     <p style="font-size:11px;color:var(--g400);text-align:center;margin-top:20px;">
-      First time? Admin logs in first and creates all other users.
+      <span id="authModePrompt">Need an account?</span>
+      <button class="auth-switch" id="authModeToggle" type="button" onclick="toggleAuthMode()">Sign up with email</button>
     </p>
     <div style="text-align:center; margin-top:20px;">
       <p style="font-size:12px;color:var(--g700);margin-bottom:8px;">New Student?</p>
@@ -851,6 +899,7 @@ input, select, textarea, button { max-width: 100%; }
   </div>
 </div>
 
+<script src="/neon-auth-client.js"></script>
 <script>
 // ╔══════════════════════════════════════════════════════════════╗
 // ║               NUU UMS — DATA API                              ║
@@ -866,11 +915,12 @@ function toggleSidebar() {
 }
 
 const DB = {
-  request: (method, path, data) => {
+  request: (method, path, data, headers) => {
     try {
       const xhr = new XMLHttpRequest();
       xhr.open(method, '/api/' + path, false);
       xhr.setRequestHeader('Content-Type', 'application/json');
+      Object.entries(headers || {}).forEach(([name, value]) => xhr.setRequestHeader(name, value));
       xhr.send(data === undefined ? null : JSON.stringify(data));
       if (xhr.status >= 200 && xhr.status < 300) return xhr.responseText ? JSON.parse(xhr.responseText) : null;
       let message = 'Backend request failed (' + xhr.status + ').';
@@ -989,29 +1039,213 @@ async function submitApplication(e) {
 // ╚══════════════════════════════════════════════════════════════╝
 let currentUser = null;
 
-function doLogin(e) {
-  e.preventDefault();
-  const u = document.getElementById('lu').value.trim();
-  const p = document.getElementById('lp').value;
-  let result;
-  try { result = DB.request('POST', 'auth/login', {username:u,password:p}); }
-  catch (_) { result = null; }
-  if (!result?.user) {
-    document.getElementById('loginError').style.display = 'flex';
-    return;
+function clearLoginMessage() {
+  const error = document.getElementById('loginError');
+  const status = document.getElementById('authStatus');
+  if (error) {
+    error.textContent = '';
+    error.style.display = 'none';
   }
-  document.getElementById('loginError').style.display = 'none';
-  currentUser = result.user;
-  enterApp();
+  if (status) {
+    status.textContent = '';
+    status.hidden = true;
+  }
+  document.getElementById('authSignOut').hidden = true;
 }
 
-function doLogout() {
+function showLoginError(message) {
+  const error = document.getElementById('loginError');
+  error.textContent = message;
+  error.style.display = 'block';
+}
+
+function showAuthStatus(message, email, canSignOut, signedIn = true) {
+  const status = document.getElementById('authStatus');
+  status.textContent = email
+    ? `${message}${signedIn ? ` Signed in to Neon Auth as ${email}.` : ''}`
+    : message;
+  status.hidden = false;
+  document.getElementById('authSignOut').hidden = !canSignOut;
+}
+
+function showLoginForm() {
+  clearLoginMessage();
+  document.getElementById('loginForm').hidden = false;
+  document.getElementById('signupForm').hidden = true;
+  document.getElementById('verificationForm').hidden = true;
+  document.querySelector('.login-right h2').textContent = 'Sign In';
+  document.querySelector('.login-sub').textContent = 'Sign in with your Neon Auth email and password';
+  document.getElementById('authModePrompt').hidden = false;
+  document.getElementById('authModeToggle').hidden = false;
+  document.getElementById('authModePrompt').textContent = 'Need an account?';
+  document.getElementById('authModeToggle').textContent = 'Sign up with email';
+}
+
+function showVerificationForm(email) {
+  clearLoginMessage();
+  document.getElementById('loginForm').hidden = true;
+  document.getElementById('signupForm').hidden = true;
+  document.getElementById('verificationForm').hidden = false;
+  document.getElementById('verificationEmail').value = email;
+  document.querySelector('.login-right h2').textContent = 'Verify Email';
+  document.querySelector('.login-sub').textContent = 'Enter the verification code sent to your email';
+  document.getElementById('authModePrompt').hidden = true;
+  document.getElementById('authModeToggle').hidden = true;
+}
+
+function toggleAuthMode() {
+  if (!document.getElementById('verificationForm').hidden) {
+    showLoginForm();
+    return;
+  }
+  const signingUp = document.getElementById('signupForm').hidden;
+  clearLoginMessage();
+  document.getElementById('loginForm').hidden = signingUp;
+  document.getElementById('signupForm').hidden = !signingUp;
+  document.querySelector('.login-right h2').textContent = signingUp ? 'Create Account' : 'Sign In';
+  document.querySelector('.login-sub').textContent = signingUp
+    ? 'Create your Neon Auth account with your email'
+    : 'Sign in with your Neon Auth email and password';
+  document.getElementById('authModePrompt').hidden = false;
+  document.getElementById('authModeToggle').hidden = false;
+  document.getElementById('authModePrompt').textContent = signingUp ? 'Already have an account?' : 'Need an account?';
+  document.getElementById('authModeToggle').textContent = signingUp ? 'Sign in' : 'Sign up with email';
+}
+
+async function exchangeNeonSession(auth) {
+  const sessionResult = await auth.getSession();
+  if (sessionResult.error) throw new Error(sessionResult.error.message || 'Could not read the Neon Auth session.');
+  const token = sessionResult.data?.session?.token;
+  if (!token) throw new Error('Neon Auth did not return a session token.');
+  const result = DB.request('POST', 'auth/exchange', {}, { Authorization: `Bearer ${token}` });
+  return { user: result.user, authUser: sessionResult.data.user };
+}
+
+async function doLogin(e) {
+  e.preventDefault();
+  clearLoginMessage();
+  const email = document.getElementById('lu').value.trim();
+  const password = document.getElementById('lp').value;
+  try {
+    const auth = await window.NUUAuthReady;
+    const result = await auth.signIn.email({ email, password });
+    if (result.error) throw new Error(result.error.message || 'Could not sign in with Neon Auth.');
+    const portal = await exchangeNeonSession(auth);
+    currentUser = portal.user;
+    enterApp();
+  } catch (error) {
+    if (error.message && /portal role|verify your email/i.test(error.message)) {
+      try {
+        const auth = await window.NUUAuthReady;
+        const session = await auth.getSession();
+        showAuthStatus(error.message, session.data?.user?.email || email, Boolean(session.data?.session));
+      } catch (sessionError) {
+        showLoginError(sessionError.message || error.message);
+      }
+      return;
+    }
+    showLoginError(error.message || 'Could not sign in. Please try again.');
+  }
+}
+
+async function doSignUp(e) {
+  e.preventDefault();
+  clearLoginMessage();
+  const name = document.getElementById('suName').value.trim();
+  const email = document.getElementById('suEmail').value.trim();
+  const password = document.getElementById('suPassword').value;
+  try {
+    const auth = await window.NUUAuthReady;
+    const result = await auth.signUp.email({ name, email, password });
+    if (result.error) throw new Error(result.error.message || 'Could not create the Neon Auth account.');
+    const sessionResult = await auth.getSession();
+    const authUser = sessionResult.data?.user || result.data?.user;
+    if (!authUser) throw new Error('Neon Auth did not return the new user.');
+    if (sessionResult.error || !sessionResult.data?.session) {
+      document.getElementById('signupForm').reset();
+      showVerificationForm(authUser.email);
+      showAuthStatus(`Account created for ${authUser.email}. Check your email for a verification code.`, '', false);
+      return;
+    }
+    document.getElementById('signupForm').reset();
+    try {
+      const portal = await exchangeNeonSession(auth);
+      currentUser = portal.user;
+      enterApp();
+    } catch (error) {
+      showAuthStatus(`Neon Auth account created. ${error.message}`, authUser.email, true);
+    }
+  } catch (error) {
+    showLoginError(error.message || 'Could not create the Neon Auth account.');
+  }
+}
+
+async function verifyNeonEmail(e) {
+  e.preventDefault();
+  clearLoginMessage();
+  const email = document.getElementById('verificationEmail').value.trim();
+  const otp = document.getElementById('verificationCode').value.trim();
+  try {
+    const auth = await window.NUUAuthReady;
+    const result = await auth.emailOtp.verifyEmail({ email, otp });
+    if (result.error) throw new Error(result.error.message || 'Email verification failed.');
+    const sessionResult = await auth.getSession();
+    if (sessionResult.error) throw new Error(sessionResult.error.message || 'Email was verified, but the session could not be read.');
+    if (!sessionResult.data?.session) {
+      showLoginForm();
+      document.getElementById('lu').value = email;
+      showAuthStatus('Email verified. Sign in with your new Neon Auth password.', email, false, false);
+      return;
+    }
+    try {
+      const portal = await exchangeNeonSession(auth);
+      currentUser = portal.user;
+      enterApp();
+    } catch (error) {
+      showAuthStatus(error.message || 'Your email is verified, but portal access is not assigned.', email, true);
+    }
+  } catch (error) {
+    showLoginError(error.message || 'Email verification failed.');
+  }
+}
+
+async function resendNeonVerification() {
+  clearLoginMessage();
+  const email = document.getElementById('verificationEmail').value.trim();
+  try {
+    const auth = await window.NUUAuthReady;
+    const result = await auth.emailOtp.sendVerificationOtp({ email, type: 'email-verification' });
+    if (result.error) throw new Error(result.error.message || 'Could not resend the verification code.');
+    showAuthStatus('A new verification code was sent.', '', false);
+  } catch (error) {
+    showLoginError(error.message || 'Could not resend the verification code.');
+  }
+}
+
+async function doLogout() {
   if (!confirm('Log out of AFRICAN ARK COLLEGE OF MANAGEMENT SCIENCES Portal?')) return;
-  try { DB.request('POST','auth/logout',{}); } catch (_) {}
+  let authError = null;
+  let appError = null;
+  try {
+    const auth = await window.NUUAuthReady;
+    const result = await auth.signOut();
+    if (result.error) authError = new Error(result.error.message || 'Neon Auth sign-out failed.');
+  } catch (error) {
+    authError = error;
+  }
+  try {
+    DB.request('POST', 'auth/logout', {});
+  } catch (error) {
+    appError = error;
+  }
   currentUser = null;
   show('loginScreen');
   document.getElementById('lu').value = '';
   document.getElementById('lp').value = '';
+  showLoginForm();
+  if (authError || appError) {
+    showLoginError(authError?.message || appError?.message || 'Sign-out did not complete successfully.');
+  }
 }
 
 function enterApp() {
@@ -1024,11 +1258,29 @@ function enterApp() {
   document.getElementById('darkLabel').textContent = darkMode ? 'Light Mode' : 'Dark Mode';
   if (currentUser.must_change_pass) {
     navigate('changePass');
-    showAlert('⚠️ You are using a temporary password. Please change it now.','warning');
+    showAlert('Please change your Neon Auth password before continuing.','warning');
     return;
   }
   navigate('dashboard');
 }
+
+async function restoreNeonSession() {
+  const auth = await window.NUUAuthReady;
+  const sessionResult = await auth.getSession();
+  if (sessionResult.error) throw new Error(sessionResult.error.message || 'Could not restore the Neon Auth session.');
+  if (!sessionResult.data?.session) return;
+  try {
+    const portal = await exchangeNeonSession(auth);
+    currentUser = portal.user;
+    enterApp();
+  } catch (error) {
+    showAuthStatus(error.message || 'Your Neon account cannot access the portal yet.', sessionResult.data.user?.email, true);
+  }
+}
+
+window.NUUAuthReady.then(restoreNeonSession).catch(error => {
+  showLoginError(error.message || 'Neon Auth is not available.');
+});
 
 // ╔══════════════════════════════════════════════════════════════╗
 // ║               RBAC — PERMISSIONS                             ║
@@ -3119,7 +3371,7 @@ pages.myProfile = () => {
   </div>`;
 };
 
-function changeMyPass() {
+async function changeMyPass() {
   const cur = document.getElementById('cp_cur')?.value;
   const nw  = document.getElementById('cp_new')?.value;
   const con = document.getElementById('cp_con')?.value;
@@ -3127,10 +3379,21 @@ function changeMyPass() {
   if(nw.length < 10){showAlert('New password must be at least 10 characters.','error');return;}
   if(nw!==con){showAlert('Passwords do not match.','error');return;}
   try {
-    DB.request('POST','auth/password',{current_password:cur,new_password:nw});
+    await updateNeonPassword(cur, nw);
     currentUser.must_change_pass = false;
+    document.getElementById('cp_cur').value = '';
+    document.getElementById('cp_new').value = '';
+    document.getElementById('cp_con').value = '';
     showAlert('Password updated successfully!');
-  } catch (error) { showAlert(error.message || 'Could not update password.','error'); }
+  } catch (error) {
+    showAlert(error.message || 'Could not update password.','error');
+  }
+}
+
+async function updateNeonPassword(currentPassword, newPassword) {
+  const auth = await window.NUUAuthReady;
+  const result = await auth.changePassword({ currentPassword, newPassword });
+  if (result.error) throw new Error(result.error.message || 'Could not update the Neon Auth password.');
 }
 
 // ─── LECTURER PAGES ────────────────────────────────────────────
@@ -3581,7 +3844,7 @@ pages.changePass = () => `
       <span class="serif" style="color:var(--amber-lt);font-size:18px;">🔐 Change Your Password</span>
     </div>
     <div class="card-body">
-      <div class="alert alert-warning mb-4">⚠️ You are using a temporary password. Set a new password of at least 10 characters before continuing.</div>
+      <div class="alert alert-warning mb-4">Change your Neon Auth password to continue. Use at least 10 characters.</div>
       <div class="form-group mb-3"><label class="form-label">Current / Temp Password</label>
         <div style="position: relative;">
           <input type="password" class="form-control" id="fcp_cur" style="padding-right: 40px;">
@@ -3605,15 +3868,19 @@ pages.changePass = () => `
   </div>
   </div>`;
 
-function forceChangePass() {
+async function forceChangePass() {
   const cur = document.getElementById('fcp_cur')?.value;
   const nw  = document.getElementById('fcp_new')?.value;
   const con = document.getElementById('fcp_con')?.value;
+  if(!cur||!nw||!con){showAlert('All fields required.','error');return;}
   if(nw.length < 10){showAlert('New password must be at least 10 characters.','error');return;}
   if(nw!==con){showAlert('Passwords do not match.','error');return;}
   try {
-    DB.request('POST','auth/password',{current_password:cur,new_password:nw});
+    await updateNeonPassword(cur, nw);
     currentUser.must_change_pass = false;
+    document.getElementById('fcp_cur').value = '';
+    document.getElementById('fcp_new').value = '';
+    document.getElementById('fcp_con').value = '';
     showAlert('✅ Password changed! Redirecting…');
     setTimeout(()=>navigate('dashboard'),1200);
   } catch (error) { showAlert(error.message || 'Could not update password.','error'); }
@@ -3685,18 +3952,9 @@ function saveStudent(id){
 // ╔══════════════════════════════════════════════════════════════╗
 // ║                    INIT                                       ║
 // ╚══════════════════════════════════════════════════════════════╝
-// Reference data is initialized in SQLite by the server. Load public departments
-// for the application form without exposing private records before sign-in.
+// Load public departments for the application form without exposing private records.
 const appDeptEl = document.getElementById('app_dept');
 if (appDeptEl) appDeptEl.innerHTML = '<option value="">— Select Department —</option>' + DB.get('departments').map(d=>`<option value="${d.id}">${d.name}</option>`).join('');
-
-// Restore the server session after a page refresh without persisting auth tokens
-// in browser storage; the session cookie is HttpOnly and SameSite.
-try {
-  const session = DB.request('GET','auth/me');
-  currentUser = session.user;
-  enterApp();
-} catch (_) {}
 
 </script>
 </body>

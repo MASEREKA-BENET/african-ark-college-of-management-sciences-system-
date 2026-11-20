@@ -5,6 +5,8 @@ import server
 
 if not server.DATABASE_URL:
     raise RuntimeError("DATABASE_URL must be configured for the Vercel API function.")
+if not server.NEON_AUTH_BASE_URL or not server.NEON_AUTH_JWKS_URL:
+    raise RuntimeError("NEON_AUTH_BASE_URL and NEON_AUTH_JWKS_URL must be configured for the Vercel API function.")
 
 server.seed_database()
 

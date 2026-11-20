@@ -7,6 +7,7 @@ import hmac
 import html
 import io
 import json
+import logging
 import os
 import re
 import base64
@@ -15,6 +16,7 @@ import mimetypes
 import secrets
 import threading
 import time
+import uuid
 import zipfile
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime, timezone
@@ -22,10 +24,18 @@ from contextlib import contextmanager
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import URLError
 from urllib.parse import unquote, urlparse
 
+import jwt
+from dotenv import load_dotenv
+
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+NEON_AUTH_BASE_URL = os.environ.get("NEON_AUTH_BASE_URL", "").rstrip("/")
+NEON_AUTH_JWKS_URL = os.environ.get("NEON_AUTH_JWKS_URL", "")
+NEON_AUTH_JWKS_CLIENT = jwt.PyJWKClient(NEON_AUTH_JWKS_URL, timeout=5) if NEON_AUTH_JWKS_URL else None
 POSTGRES_SCHEMA_READY = False
 POSTGRES_SCHEMA_LOCK = threading.Lock()
 MAX_BODY = 12 * 1024 * 1024
@@ -275,6 +285,32 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 DUMMY_PASSWORD_HASH = password_hash(secrets.token_urlsafe(24))
+LOGGER = logging.getLogger(__name__)
+
+
+def verify_neon_auth_token(token):
+    if not NEON_AUTH_BASE_URL or not NEON_AUTH_JWKS_CLIENT:
+        return None
+    auth_origin = urlparse(NEON_AUTH_BASE_URL)
+    if auth_origin.scheme != "https" or not auth_origin.netloc:
+        raise RuntimeError("NEON_AUTH_BASE_URL must be an HTTPS URL.")
+    expected_origin = f"{auth_origin.scheme}://{auth_origin.netloc}"
+    try:
+        signing_key = NEON_AUTH_JWKS_CLIENT.get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["EdDSA"],
+            issuer=expected_origin,
+            audience=expected_origin,
+            options={"require": ["exp", "iss", "aud", "sub"]},
+        )
+    except (jwt.PyJWTError, URLError, TimeoutError, OSError) as error:
+        LOGGER.warning("Neon Auth token verification failed (%s).", type(error).__name__)
+        return None
+    if claims.get("role") != "authenticated":
+        return None
+    return claims
 
 
 @contextmanager
@@ -595,8 +631,21 @@ class Handler(BaseHTTPRequestHandler):
                 db.check()
             self.respond(200, {"status":"ok","storage":"postgresql" if DATABASE_URL else "memory","persistent":bool(DATABASE_URL)})
             return
+        if path == "/api/auth/config":
+            if not NEON_AUTH_BASE_URL:
+                self.respond(503, {"error":"Neon Auth is not configured on this server."})
+                return
+            self.respond(200, {"auth_url":NEON_AUTH_BASE_URL})
+            return
         if path in ("/", "/project.html"):
             self.respond(200, (ROOT / "project.html").read_bytes(), content_type="text/html; charset=utf-8")
+            return
+        if path == "/neon-auth-client.js":
+            bundle = ROOT / "dist" / "neon-auth-client.js"
+            if not bundle.is_file():
+                self.respond(503, {"error":"Build the Neon Auth client bundle before serving the app."})
+                return
+            self.respond(200, bundle.read_bytes(), content_type="text/javascript; charset=utf-8")
             return
         if unquote(path) == "/ark logo.JPG":
             logo = ROOT / "ark logo.JPG"
@@ -715,6 +764,9 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise ValueError("A JSON object is required.")
             if path == "/api/auth/login":
+                if NEON_AUTH_BASE_URL:
+                    self.respond(410, {"error":"Password sign-in is managed by Neon Auth."})
+                    return
                 username = str(data.get("username", "")).strip()[:128]
                 password = str(data.get("password", ""))
                 with connect() as db:
@@ -735,9 +787,66 @@ class Handler(BaseHTTPRequestHandler):
                 cookie = f"nuu_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}" + ("; Secure" if COOKIE_SECURE else "")
                 self.respond(200, {"user":sanitize_user(user)}, {"Set-Cookie":cookie})
                 return
+            if path == "/api/auth/exchange":
+                if not NEON_AUTH_BASE_URL or not NEON_AUTH_JWKS_CLIENT:
+                    self.respond(503, {"error":"Neon Auth is not fully configured on this server."})
+                    return
+                authorization = self.headers.get("Authorization", "")
+                scheme, separator, token = authorization.partition(" ")
+                if not separator or scheme.casefold() != "bearer" or not token.strip():
+                    self.respond(401, {"error":"A Neon Auth token is required."})
+                    return
+                claims = verify_neon_auth_token(token.strip())
+                if not claims:
+                    self.respond(401, {"error":"The Neon Auth session is invalid or expired."})
+                    return
+                try:
+                    neon_user_id = uuid.UUID(str(claims["sub"]))
+                except (KeyError, ValueError, TypeError):
+                    self.respond(401, {"error":"The Neon Auth session has an invalid user identity."})
+                    return
+                with connect() as db:
+                    neon_user = db.connection.execute(
+                        'SELECT email, "emailVerified", banned FROM neon_auth."user" WHERE id=%s',
+                        (neon_user_id,),
+                    ).fetchone()
+                    if not neon_user or neon_user["banned"]:
+                        self.respond(401, {"error":"The Neon Auth account is not active."})
+                        return
+                    if not neon_user["emailVerified"]:
+                        self.respond(403, {"error":"Verify your email address before accessing the portal."})
+                        return
+                    email = str(neon_user["email"]).strip().casefold()
+                    users = read_table(db, "users")
+                    user = next(
+                        (
+                            row for row in users
+                            if str(row.get("email", "")).strip().casefold() == email
+                            and row.get("status") == "active"
+                        ),
+                        None,
+                    )
+                    if not user:
+                        self.respond(403, {"error":"Your Neon account has no active portal role. Contact an administrator."})
+                        return
+                    db.begin_write()
+                    now = int(time.time())
+                    db.delete_expired_sessions(now)
+                    app_token = secrets.token_urlsafe(32)
+                    db.put_session(hashlib.sha256(app_token.encode()).hexdigest(), user["id"], now + SESSION_SECONDS)
+                    user["last_login"] = datetime.now(timezone.utc).isoformat()
+                    user["must_change_pass"] = False
+                    user.pop("password", None)
+                    write_table(
+                        db,
+                        "users",
+                        [user if row["id"] == user["id"] else row for row in users],
+                    )
+                cookie = f"nuu_session={app_token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}" + ("; Secure" if COOKIE_SECURE else "")
+                self.respond(200, {"user":sanitize_user(user)}, {"Set-Cookie":cookie})
+                return
             if path == "/api/auth/logout":
                 with connect() as db:
-                    user = self.session_user(db)
                     cookie = SimpleCookie(self.headers.get("Cookie", ""))
                     morsel = cookie.get("nuu_session")
                     if morsel:
@@ -745,6 +854,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, {"ok":True}, {"Set-Cookie":"nuu_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" + ("; Secure" if COOKIE_SECURE else "")})
                 return
             if path == "/api/auth/password":
+                if NEON_AUTH_BASE_URL:
+                    self.respond(410, {"error":"Passwords are managed by Neon Auth. Use its password reset flow."})
+                    return
                 with connect() as db:
                     user = self.session_user(db)
                     if not user:
@@ -1412,7 +1524,7 @@ def main():
     host=os.environ.get("NUU_HOST","127.0.0.1")
     port=int(os.environ.get("PORT",os.environ.get("NUU_PORT","8000")))
     server=ThreadingHTTPServer((host,port),Handler)
-    storage="Supabase PostgreSQL" if DATABASE_URL else "volatile in-memory storage"
+    storage="Neon PostgreSQL" if DATABASE_URL else "volatile in-memory storage"
     print(f"ACMS server running at http://{host}:{port} ({storage})")
     if bootstrap:
         print(f"Initial admin login — username: {bootstrap['username']}  password: {bootstrap['password']}")
