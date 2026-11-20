@@ -1,5 +1,3 @@
-from urllib.parse import parse_qsl, urlencode, urlsplit
-
 import server
 
 
@@ -12,14 +10,25 @@ server.seed_database()
 
 
 class handler(server.Handler):
-    def parse_request(self):
-        if not super().parse_request():
-            return False
-        parsed=urlsplit(self.path)
-        params=parse_qsl(parsed.query,keep_blank_values=True)
-        forwarded_path=next((value for key,value in params if key=="__vercel_path"),None)
-        if forwarded_path is not None:
-            route="/"+forwarded_path.lstrip("/")
-            remaining=urlencode([(key,value) for key,value in params if key!="__vercel_path"],doseq=True)
-            self.path="/api"+route+("?"+remaining if remaining else "")
-        return True
+    def _restore_rewritten_path(self):
+        self.path = server.restore_vercel_api_path(self.path)
+
+    def do_GET(self):
+        self._restore_rewritten_path()
+        super().do_GET()
+
+    def do_POST(self):
+        self._restore_rewritten_path()
+        super().do_POST()
+
+    def do_PUT(self):
+        self._restore_rewritten_path()
+        super().do_PUT()
+
+    def do_PATCH(self):
+        self._restore_rewritten_path()
+        super().do_PATCH()
+
+    def do_DELETE(self):
+        self._restore_rewritten_path()
+        super().do_DELETE()

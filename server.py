@@ -25,7 +25,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlsplit
 
 import jwt
 from dotenv import load_dotenv
@@ -45,6 +45,19 @@ PBKDF2_ROUNDS = 310_000
 COOKIE_SECURE = os.environ.get("NUU_COOKIE_SECURE", "0") == "1"
 ALLOWED_ORIGINS = {origin.strip().rstrip("/").casefold() for origin in os.environ.get("NUU_ALLOWED_ORIGINS", "").split(",") if origin.strip()}
 DUMMY_PASSWORD_HASH = None
+
+
+def restore_vercel_api_path(request_path: str) -> str:
+    parsed = urlsplit(request_path)
+    if parsed.path != "/api/router":
+        return request_path
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    forwarded_path = next((value for key, value in params if key == "nuu_path"), None)
+    if forwarded_path is None:
+        return request_path
+    route = "/" + forwarded_path.lstrip("/")
+    remaining = urlencode([(key, value) for key, value in params if key != "nuu_path"], doseq=True)
+    return "/api" + route + ("?" + remaining if remaining else "")
 
 
 class MemoryStore:

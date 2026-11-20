@@ -5,7 +5,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "/api/router?__vercel_path=/:path*"
+      "destination": "/api/router?nuu_path=/:path*"
     }
   ]
 }

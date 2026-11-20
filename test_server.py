@@ -99,6 +99,16 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status,200)
         self.assertEqual(payload,{"auth_url":"https://auth.example.test/db/auth"})
 
+    def test_vercel_rewrite_restores_api_path_and_preserves_original_query(self):
+        self.assertEqual(
+            server.restore_vercel_api_path("/api/router?nuu_path=%2Fauth%2Fconfig&lang=en"),
+            "/api/auth/config?lang=en",
+        )
+        self.assertEqual(
+            server.restore_vercel_api_path("/api/tables/users?nuu_path=%2Fauth%2Fconfig"),
+            "/api/tables/users?nuu_path=%2Fauth%2Fconfig",
+        )
+
     def test_legacy_password_login_is_disabled_when_neon_auth_is_configured(self):
         with patch.object(server,"NEON_AUTH_BASE_URL","https://auth.example.test/db/auth"):
             with self.assertRaises(HTTPError) as error:
