@@ -2,14 +2,14 @@ import http.cookiejar
 import base64
 import io
 import json
-import tempfile
+from contextlib import contextmanager
 import threading
 import unittest
 import zipfile
 from http.server import ThreadingHTTPServer
-from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+from unittest.mock import patch
 
 import server
 
@@ -18,7 +18,6 @@ class ServerTests(unittest.TestCase):
     ADMIN_PASSWORD="Bootstrap-Admin-Pass-55"
     @classmethod
     def setUpClass(cls):
-        cls.temps=[]
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -28,13 +27,9 @@ class ServerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.httpd.server_close()
-        for temp in cls.temps:
-            temp.cleanup()
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.temps.append(self.temp)
-        server.DB_PATH = Path(self.temp.name) / "test.sqlite3"
+        server.reset_store()
         server.seed_database(bootstrap_password=self.ADMIN_PASSWORD)
         self.opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
@@ -63,26 +58,26 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(server.verify_password(self.ADMIN_PASSWORD,user["password"]))
         self.assertTrue(user["must_change_pass"])
 
-    def test_postgresql_compatibility_adapter_translates_types_and_parameters(self):
-        class FakeConnection:
-            def __init__(self):
-                self.statements=[]
-            def execute(self,statement,parameters=()):
-                self.statements.append((statement,parameters))
-            def commit(self): pass
-            def rollback(self): pass
-            def close(self): pass
+    def test_health_reports_volatile_storage(self):
+        status,payload,_=self.request("GET","/api/health")
+        self.assertEqual(status,200)
+        self.assertEqual(payload["storage"],"memory")
+        self.assertFalse(payload["persistent"])
 
-        raw=FakeConnection()
-        db=server.PostgreSQLConnection(raw)
-        db.execute("CREATE TABLE files (id INTEGER PRIMARY KEY AUTOINCREMENT, content BLOB NOT NULL)")
-        db.execute("SELECT id FROM files WHERE id=?",(9,))
-        db.execute("BEGIN IMMEDIATE")
-        self.assertIn("BIGSERIAL PRIMARY KEY",raw.statements[0][0])
-        self.assertIn("BYTEA",raw.statements[0][0])
-        self.assertEqual(raw.statements[1],("SELECT id FROM files WHERE id=%s",(9,)))
-        self.assertEqual(raw.statements[2],("LOCK TABLE app_tables IN EXCLUSIVE MODE",()))
-        self.assertEqual(len(raw.statements),3)
+    def test_health_reports_postgresql_when_configured(self):
+        class HealthyStore:
+            def check(self):
+                pass
+
+        @contextmanager
+        def healthy_database():
+            yield HealthyStore()
+
+        with patch.object(server,"DATABASE_URL","postgresql://configured"), patch.object(server,"connect",healthy_database):
+            status,payload,_=self.request("GET","/api/health")
+        self.assertEqual(status,200)
+        self.assertEqual(payload["storage"],"postgresql")
+        self.assertTrue(payload["persistent"])
 
     def test_temporary_password_cannot_read_private_tables(self):
         self.login()
@@ -100,6 +95,17 @@ class ServerTests(unittest.TestCase):
             migrated=server.read_table(db,"users")[0]
         self.assertTrue(server.verify_password("Legacy-Plaintext",migrated["password"]))
         self.assertTrue(migrated["must_change_pass"])
+
+    def test_reset_discards_all_server_data_and_sessions(self):
+        self.login()
+        with server.connect() as db:
+            server.write_table(db,"announcements",[{"id":1,"title":"Temporary"}])
+        server.reset_store()
+        server.seed_database(bootstrap_password=self.ADMIN_PASSWORD)
+        with server.connect() as db:
+            self.assertEqual(server.read_table(db,"announcements"),[])
+            self.assertEqual(len(server.read_table(db,"users")),1)
+            self.assertEqual(db.sessions,{})
 
     def test_login_sets_http_only_session_and_never_returns_password(self):
         status, payload, headers = self.login()
@@ -131,6 +137,35 @@ class ServerTests(unittest.TestCase):
             sheet=archive.read("xl/worksheets/sheet1.xml").decode()
         self.assertIn("Department",sheet)
         self.assertIn("Computer Science &amp; IT",sheet)
+
+    def test_results_excel_export_contains_academic_records_and_is_role_restricted(self):
+        self.enable_admin_session()
+        with server.connect() as db:
+            users=server.read_table(db,"users")
+            users.append({"id":2,"username":"alice.example","password":server.password_hash("Alice-Password-55"),"full_name":"Alice Example","email":"alice@acms.ac.ug","role_id":2,"role_slug":"student","department_id":1,"status":"active","must_change_pass":False})
+            server.write_table(db,"users",users)
+            server.write_table(db,"students",[{"id":1,"user_id":2,"student_number":"ACMS2026-CS-001","dept_id":1,"programme":"BSc Computer Science","status":"active"}])
+            server.write_table(db,"results",[{"id":1,"student_id":1,"course_id":1,"coursework":35,"exam":52,"grade":"A","grade_points":5,"remark":"pass","status":"approved"}])
+
+        status,workbook,headers=self.request("GET","/api/exports/results.xlsx")
+        self.assertEqual(status,200)
+        self.assertIn("acms_academic_results.xlsx",headers["Content-Disposition"])
+        with zipfile.ZipFile(io.BytesIO(workbook)) as archive:
+            self.assertIsNone(archive.testzip())
+            sheet=archive.read("xl/worksheets/sheet1.xml").decode()
+        self.assertIn("Alice Example",sheet)
+        self.assertIn("BSc Computer Science",sheet)
+        self.assertIn("<v>87</v>",sheet)
+
+        with server.connect() as db:
+            users=server.read_table(db,"users")
+            users.append({"id":3,"username":"finance1","password":server.password_hash("Finance-Password-55"),"full_name":"Finance User","email":"finance@acms.ac.ug","role_id":5,"role_slug":"finance","department_id":None,"status":"active","must_change_pass":False})
+            server.write_table(db,"users",users)
+        finance=build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.request("POST","/api/auth/login",{"username":"finance1","password":"Finance-Password-55"},opener=finance)
+        with self.assertRaises(HTTPError) as error:
+            self.request("GET","/api/exports/results.xlsx",opener=finance)
+        self.assertEqual(error.exception.code,403)
 
     def test_admin_can_create_departments_and_other_roles_cannot(self):
         self.enable_admin_session()

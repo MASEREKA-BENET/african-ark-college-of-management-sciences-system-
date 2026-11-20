@@ -1,4 +1,4 @@
-"""NUU application server: SQLite persistence, password auth, sessions and RBAC."""
+"""NUU application server with volatile in-memory data, password auth and RBAC."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import base64
 import binascii
 import mimetypes
 import secrets
-import sqlite3
 import threading
 import time
 import zipfile
@@ -26,8 +25,9 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("NUU_DB_PATH", ROOT / "data" / "nuu.sqlite3"))
 DATABASE_URL = os.environ.get("DATABASE_URL")
+POSTGRES_SCHEMA_READY = False
+POSTGRES_SCHEMA_LOCK = threading.Lock()
 MAX_BODY = 12 * 1024 * 1024
 MAX_UPLOAD = 8 * 1024 * 1024
 SESSION_SECONDS = 8 * 60 * 60
@@ -35,33 +35,199 @@ PBKDF2_ROUNDS = 310_000
 COOKIE_SECURE = os.environ.get("NUU_COOKIE_SECURE", "0") == "1"
 ALLOWED_ORIGINS = {origin.strip().rstrip("/").casefold() for origin in os.environ.get("NUU_ALLOWED_ORIGINS", "").split(",") if origin.strip()}
 DUMMY_PASSWORD_HASH = None
-POSTGRES_SCHEMA_READY = False
-POSTGRES_SCHEMA_LOCK = threading.Lock()
 
 
-class PostgreSQLConnection:
-    """Small SQL compatibility wrapper for the app's SQLite/PostgreSQL queries."""
+class MemoryStore:
+    def __init__(self):
+        self.tables = {}
+        self.sessions = {}
+        self.uploads = {}
+        self.application_documents = {}
+        self.student_sequences = {}
 
+    def clear(self):
+        self.tables.clear()
+        self.sessions.clear()
+        self.uploads.clear()
+        self.application_documents.clear()
+        self.student_sequences.clear()
+
+    def table_names(self):
+        return set(self.tables)
+
+    def read_table(self, name):
+        return json.loads(json.dumps(self.tables.get(name, []), ensure_ascii=False))
+
+    def write_table(self, name, encoded):
+        self.tables[name] = json.loads(encoded)
+
+    def get_session(self, token_hash):
+        return self.sessions.get(token_hash)
+
+    def put_session(self, token_hash, user_id, expires):
+        self.sessions[token_hash] = {"user_id":user_id,"expires":expires}
+
+    def delete_session(self, token_hash):
+        self.sessions.pop(token_hash,None)
+
+    def delete_expired_sessions(self, now):
+        self.sessions = {key: session for key, session in self.sessions.items() if session["expires"] > now}
+
+    def delete_sessions_for_user(self, user_id):
+        self.sessions = {
+            token: session for token, session in self.sessions.items()
+            if session["user_id"] != user_id
+        }
+
+    def get_upload(self, upload_id):
+        return self.uploads.get(upload_id)
+
+    def create_upload(self, owner_id, assignment_id, filename, media_type, content, created_at):
+        upload_id = max(self.uploads, default=0) + 1
+        self.uploads[upload_id] = {
+            "id": upload_id, "owner_id": owner_id, "assignment_id": assignment_id,
+            "filename": filename, "media_type": media_type, "content": content,
+            "created_at": created_at,
+        }
+        return upload_id
+
+    def get_application_document(self, document_id):
+        return self.application_documents.get(document_id)
+
+    def create_application_document(self, application_id, filename, media_type, content, created_at):
+        document_id = max(self.application_documents, default=0) + 1
+        self.application_documents[document_id] = {
+            "id": document_id, "application_id": application_id, "filename": filename,
+            "media_type": media_type, "content": content, "created_at": created_at,
+        }
+        return document_id
+
+    def get_student_sequence(self, department_id):
+        return self.student_sequences.get(department_id,0)
+
+    def set_student_sequence(self, department_id, number):
+        self.student_sequences[department_id]=number
+
+    def delete_student_sequence(self, department_id):
+        self.student_sequences.pop(department_id,None)
+
+    def delete_application_documents(self, application_id):
+        self.application_documents={
+            key:document for key,document in self.application_documents.items()
+            if document["application_id"]!=application_id
+        }
+
+    def begin_write(self):
+        return None
+
+    def check(self):
+        return None
+
+
+class PostgreSQLStore:
     def __init__(self, connection):
-        self.connection = connection
+        self.connection=connection
 
-    def execute(self, statement, parameters=()):
-        if statement == "BEGIN IMMEDIATE":
-            # Serialize the JSON-table read/modify/write flow that SQLite locks here.
-            return self.connection.execute("LOCK TABLE app_tables IN EXCLUSIVE MODE")
-        statement = statement.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
-        statement = re.sub(r"\bBLOB\b", "BYTEA", statement, flags=re.IGNORECASE)
-        statement = statement.replace("?", "%s")
-        return self.connection.execute(statement, parameters)
+    def ensure_schema(self):
+        statements=(
+            "CREATE TABLE IF NOT EXISTS app_tables (name TEXT PRIMARY KEY, rows TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL, expires BIGINT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS uploads (id BIGSERIAL PRIMARY KEY, owner_id BIGINT NOT NULL, assignment_id BIGINT NOT NULL, filename TEXT NOT NULL, media_type TEXT NOT NULL, content BYTEA NOT NULL, created_at TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS application_documents (id BIGSERIAL PRIMARY KEY, application_id BIGINT NOT NULL, filename TEXT NOT NULL, media_type TEXT NOT NULL, content BYTEA NOT NULL, created_at TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS student_sequences (department_id BIGINT PRIMARY KEY, last_number BIGINT NOT NULL)",
+        )
+        for statement in statements:
+            self.connection.execute(statement)
 
-    def commit(self):
-        self.connection.commit()
+    def table_names(self):
+        return {row["name"] for row in self.connection.execute("SELECT name FROM app_tables")}
 
-    def rollback(self):
-        self.connection.rollback()
+    def read_table(self, name):
+        row=self.connection.execute("SELECT rows FROM app_tables WHERE name=%s",(name,)).fetchone()
+        return json.loads(row["rows"]) if row else []
 
-    def close(self):
-        self.connection.close()
+    def write_table(self, name, encoded):
+        self.connection.execute(
+            "INSERT INTO app_tables(name,rows) VALUES(%s,%s) ON CONFLICT(name) DO UPDATE SET rows=excluded.rows",
+            (name,encoded),
+        )
+
+    def begin_write(self):
+        self.connection.execute("LOCK TABLE app_tables IN EXCLUSIVE MODE")
+
+    def check(self):
+        self.connection.execute("SELECT 1")
+
+    def get_session(self, token_hash):
+        return self.connection.execute(
+            "SELECT user_id,expires FROM sessions WHERE token_hash=%s",(token_hash,)
+        ).fetchone()
+
+    def put_session(self, token_hash, user_id, expires):
+        self.connection.execute(
+            "INSERT INTO sessions(token_hash,user_id,expires) VALUES(%s,%s,%s) "
+            "ON CONFLICT(token_hash) DO UPDATE SET user_id=excluded.user_id,expires=excluded.expires",
+            (token_hash,user_id,expires),
+        )
+
+    def delete_session(self, token_hash):
+        self.connection.execute("DELETE FROM sessions WHERE token_hash=%s",(token_hash,))
+
+    def delete_expired_sessions(self, now):
+        self.connection.execute("DELETE FROM sessions WHERE expires<=%s",(now,))
+
+    def delete_sessions_for_user(self, user_id):
+        self.connection.execute("DELETE FROM sessions WHERE user_id=%s",(user_id,))
+
+    def get_upload(self, upload_id):
+        return self.connection.execute(
+            "SELECT filename,media_type,content FROM uploads WHERE id=%s",(upload_id,)
+        ).fetchone()
+
+    def create_upload(self, owner_id, assignment_id, filename, media_type, content, created_at):
+        row=self.connection.execute(
+            "INSERT INTO uploads(owner_id,assignment_id,filename,media_type,content,created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s) RETURNING id",
+            (owner_id,assignment_id,filename,media_type,content,created_at),
+        ).fetchone()
+        return row["id"]
+
+    def get_application_document(self, document_id):
+        return self.connection.execute(
+            "SELECT application_id,filename,media_type,content FROM application_documents WHERE id=%s",
+            (document_id,),
+        ).fetchone()
+
+    def create_application_document(self, application_id, filename, media_type, content, created_at):
+        row=self.connection.execute(
+            "INSERT INTO application_documents(application_id,filename,media_type,content,created_at) "
+            "VALUES(%s,%s,%s,%s,%s) RETURNING id",
+            (application_id,filename,media_type,content,created_at),
+        ).fetchone()
+        return row["id"]
+
+    def get_student_sequence(self, department_id):
+        row=self.connection.execute(
+            "SELECT last_number FROM student_sequences WHERE department_id=%s",(department_id,)
+        ).fetchone()
+        return row["last_number"] if row else 0
+
+    def set_student_sequence(self, department_id, number):
+        self.connection.execute(
+            "INSERT INTO student_sequences(department_id,last_number) VALUES(%s,%s) "
+            "ON CONFLICT(department_id) DO UPDATE SET last_number=excluded.last_number",
+            (department_id,number),
+        )
+
+    def delete_student_sequence(self, department_id):
+        self.connection.execute("DELETE FROM student_sequences WHERE department_id=%s",(department_id,))
+
+    def delete_application_documents(self, application_id):
+        self.connection.execute("DELETE FROM application_documents WHERE application_id=%s",(application_id,))
+
+
+STORE = MemoryStore()
+STORE_LOCK = threading.RLock()
 
 
 TABLES = (
@@ -118,58 +284,29 @@ def connect():
             import psycopg
             from psycopg.rows import dict_row
         except ImportError as error:
-            raise RuntimeError("Install the requirements.txt dependencies to use PostgreSQL.") from error
-
-        raw_db = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-        db = PostgreSQLConnection(raw_db)
-        schema_statements = (
-            "CREATE TABLE IF NOT EXISTS app_tables (name TEXT PRIMARY KEY, rows TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires INTEGER NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS uploads (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, assignment_id INTEGER NOT NULL, filename TEXT NOT NULL, media_type TEXT NOT NULL, content BLOB NOT NULL, created_at TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS application_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, application_id INTEGER NOT NULL, filename TEXT NOT NULL, media_type TEXT NOT NULL, content BLOB NOT NULL, created_at TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS student_sequences (department_id INTEGER PRIMARY KEY, last_number INTEGER NOT NULL)",
-        )
-        try:
+            raise RuntimeError("Install the PostgreSQL driver from requirements.txt.") from error
+        with psycopg.connect(DATABASE_URL,row_factory=dict_row,prepare_threshold=None) as connection:
+            db=PostgreSQLStore(connection)
             global POSTGRES_SCHEMA_READY
             if not POSTGRES_SCHEMA_READY:
                 with POSTGRES_SCHEMA_LOCK:
                     if not POSTGRES_SCHEMA_READY:
-                        for statement in schema_statements:
-                            db.execute(statement)
-                        db.commit()
-                        POSTGRES_SCHEMA_READY = True
+                        db.ensure_schema()
+                        connection.commit()
+                        POSTGRES_SCHEMA_READY=True
             yield db
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-        return
+    else:
+        with STORE_LOCK:
+            yield STORE
 
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(DB_PATH, timeout=15)
-    db.row_factory = sqlite3.Row
-    try:
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA foreign_keys=ON")
-        db.execute("CREATE TABLE IF NOT EXISTS app_tables (name TEXT PRIMARY KEY, rows TEXT NOT NULL)")
-        db.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires INTEGER NOT NULL)")
-        db.execute("CREATE TABLE IF NOT EXISTS uploads (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, assignment_id INTEGER NOT NULL, filename TEXT NOT NULL, media_type TEXT NOT NULL, content BLOB NOT NULL, created_at TEXT NOT NULL)")
-        db.execute("CREATE TABLE IF NOT EXISTS application_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, application_id INTEGER NOT NULL, filename TEXT NOT NULL, media_type TEXT NOT NULL, content BLOB NOT NULL, created_at TEXT NOT NULL)")
-        db.execute("CREATE TABLE IF NOT EXISTS student_sequences (department_id INTEGER PRIMARY KEY, last_number INTEGER NOT NULL)")
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+
+def reset_store():
+    with STORE_LOCK:
+        STORE.clear()
 
 
 def read_table(db, name):
-    row = db.execute("SELECT rows FROM app_tables WHERE name=?", (name,)).fetchone()
-    return json.loads(row["rows"]) if row else []
+    return db.read_table(name)
 
 
 def write_table(db, name, rows):
@@ -190,7 +327,7 @@ def write_table(db, name, rows):
         return value
     rows=clean(rows)
     encoded = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
-    db.execute("INSERT INTO app_tables(name,rows) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET rows=excluded.rows", (name, encoded))
+    db.write_table(name,encoded)
 
 
 def seed_database(bootstrap_password=None):
@@ -233,7 +370,8 @@ def seed_database(bootstrap_password=None):
         "settings":settings,"audit_logs":[],"announcements":[],"notifications":[],"registrations":[],"results":[],"fee_payments":[],"assignments":[],"hostel_allocations":[],"students":[],"messages":[],"books":[],"applications":[],"submissions":[],
     }
     with connect() as db:
-        existing = {row["name"] for row in db.execute("SELECT name FROM app_tables")}
+        db.begin_write()
+        existing = db.table_names()
         existing_users=read_table(db,"users") if "users" in existing else []
         created_admin=not existing_users
         if created_admin and len(bootstrap_password)<10:
@@ -290,7 +428,10 @@ def department_workbook(departments, programs, courses):
             sum(1 for program in programs if program.get("dept_id") == dept_id),
             sum(1 for course in courses if course.get("dept_id") == dept_id),
         ])
+    return xlsx_workbook("Departments", rows)
 
+
+def xlsx_workbook(sheet_name, rows):
     def column_name(number):
         result = ""
         while number:
@@ -303,8 +444,11 @@ def department_workbook(departments, programs, courses):
         cells = []
         for column_number, value in enumerate(values, 1):
             ref = f"{column_name(column_number)}{row_number}"
-            text = xml_escape(str(value), {"\"": "&quot;"})
-            cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>')
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                cells.append(f'<c r="{ref}"><v>{value}</v></c>')
+            else:
+                text = xml_escape(str(value if value is not None else ""), {"\"": "&quot;"})
+                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>')
         sheet_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
     sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
              '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
@@ -312,7 +456,7 @@ def department_workbook(departments, programs, courses):
     workbook = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                 '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
                 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-                '<sheets><sheet name="Departments" sheetId="1" r:id="rId1"/></sheets></workbook>')
+                f'<sheets><sheet name="{xml_escape(sheet_name)}" sheetId="1" r:id="rId1"/></sheets></workbook>')
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
@@ -321,6 +465,28 @@ def department_workbook(departments, programs, courses):
         archive.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>')
         archive.writestr("xl/worksheets/sheet1.xml", sheet)
     return output.getvalue()
+
+
+def results_workbook(results, students, users, courses, departments):
+    students_by_id={student["id"]:student for student in students}
+    users_by_id={user["id"]:user for user in users}
+    courses_by_id={course["id"]:course for course in courses}
+    departments_by_id={department["id"]:department for department in departments}
+    rows=[["Student Number","Student Name","Department","Programme","Course Code","Course Name","Coursework","Exam","Total","Grade","Grade Points","Remark","Status"]]
+    for result in results:
+        student=students_by_id.get(result.get("student_id"),{})
+        account=users_by_id.get(student.get("user_id"),{})
+        course=courses_by_id.get(result.get("course_id"),{})
+        department=departments_by_id.get(student.get("dept_id"),{})
+        coursework=result.get("coursework",0) or 0
+        exam=result.get("exam",0) or 0
+        student_number=re.sub(r"^NUU(?=[0-9-])","ACMS",str(student.get("student_number", "")))
+        rows.append([
+            student_number,account.get("full_name", ""),department.get("name", ""),student.get("programme", ""),
+            course.get("code", ""),course.get("name", ""),coursework,exam,coursework+exam,
+            result.get("grade", ""),result.get("grade_points", ""),result.get("remark", ""),result.get("status", ""),
+        ])
+    return xlsx_workbook("Results", rows)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -371,10 +537,10 @@ class Handler(BaseHTTPRequestHandler):
         if not morsel:
             return None
         token_hash = hashlib.sha256(morsel.value.encode()).hexdigest()
-        row = db.execute("SELECT user_id FROM sessions WHERE token_hash=? AND expires>?", (token_hash, int(time.time()))).fetchone()
-        if not row:
+        session = db.get_session(token_hash)
+        if not session or session["expires"] <= int(time.time()):
             return None
-        return next((u for u in read_table(db, "users") if u["id"] == row["user_id"] and u.get("status") == "active"), None)
+        return next((u for u in read_table(db, "users") if u["id"] == session["user_id"] and u.get("status") == "active"), None)
 
     def table_response(self, db, name, user):
         rows = read_table(db, name)
@@ -425,7 +591,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            self.respond(200, {"status":"ok","database":"sqlite"})
+            with connect() as db:
+                db.check()
+            self.respond(200, {"status":"ok","storage":"postgresql" if DATABASE_URL else "memory","persistent":bool(DATABASE_URL)})
             return
         if path in ("/", "/project.html"):
             self.respond(200, (ROOT / "project.html").read_bytes(), content_type="text/html; charset=utf-8")
@@ -452,7 +620,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.respond(401,{"error":"Sign in to access application credentials."});return
                 if user.get("must_change_pass") or user.get("role_slug") not in {"admin","registrar"}:
                     self.respond(403,{"error":"Only administrators and registrars can access application credentials."});return
-                document=db.execute("SELECT filename,media_type,content FROM application_documents WHERE id=? AND application_id=?",(document_id,application_id)).fetchone()
+                document=db.get_application_document(document_id)
+                if document and document["application_id"] != application_id:
+                    document=None
             if not document:
                 self.respond(404,{"error":"Application credential not found."});return
             filename=re.sub(r'[\x00-\x1f\x7f"]',"",Path(document["filename"]).name)
@@ -475,6 +645,18 @@ class Handler(BaseHTTPRequestHandler):
                 "Content-Disposition":"attachment; filename=department_directory.xlsx",
             }, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             return
+        if path == "/api/exports/results.xlsx":
+            with connect() as db:
+                user=self.session_user(db)
+                if not user:
+                    self.respond(401,{"error":"Sign in to export academic results."});return
+                if user.get("must_change_pass"):
+                    self.respond(403,{"error":"Change your temporary password before exporting data."});return
+                if user.get("role_slug") not in {"admin","registrar"}:
+                    self.respond(403,{"error":"Only administrators and academic registrars can export results."});return
+                workbook=results_workbook(read_table(db,"results"),read_table(db,"students"),read_table(db,"users"),read_table(db,"courses"),read_table(db,"departments"))
+            self.respond(200,workbook,{"Content-Disposition":"attachment; filename=acms_academic_results.xlsx"},"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            return
         if path.startswith("/api/submissions/") and path.endswith("/download"):
             try:
                 submission_id=int(path.removeprefix("/api/submissions/").removesuffix("/download").strip("/"))
@@ -492,7 +674,7 @@ class Handler(BaseHTTPRequestHandler):
                 if submission and user["role_slug"]=="lecturer":
                     assignments=read_table(db,"assignments")
                     allowed=any(a.get("id")==submission.get("assignment_id") and a.get("created_by")==user["id"] for a in assignments)
-                upload=db.execute("SELECT filename,media_type,content FROM uploads WHERE id=?",(submission.get("upload_id"),)).fetchone() if allowed else None
+                upload=db.get_upload(submission.get("upload_id")) if allowed else None
             if not upload:
                 self.respond(404,{"error":"Submission not found."})
                 return
@@ -541,11 +723,12 @@ class Handler(BaseHTTPRequestHandler):
                     if not user or user.get("status") != "active" or not password_ok:
                         self.respond(401, {"error":"Invalid username or password."})
                         return
+                    db.begin_write()
                     token = secrets.token_urlsafe(32)
                     token_hash = hashlib.sha256(token.encode()).hexdigest()
                     now = int(time.time())
-                    db.execute("DELETE FROM sessions WHERE expires<=?", (now,))
-                    db.execute("INSERT INTO sessions(token_hash,user_id,expires) VALUES(?,?,?)", (token_hash,user["id"],now+SESSION_SECONDS))
+                    db.delete_expired_sessions(now)
+                    db.put_session(token_hash,user["id"],now+SESSION_SECONDS)
                     user["last_login"] = datetime.now(timezone.utc).isoformat()
                     users = read_table(db,"users")
                     write_table(db,"users",[user if u["id"] == user["id"] else u for u in users])
@@ -558,7 +741,7 @@ class Handler(BaseHTTPRequestHandler):
                     cookie = SimpleCookie(self.headers.get("Cookie", ""))
                     morsel = cookie.get("nuu_session")
                     if morsel:
-                        db.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(morsel.value.encode()).hexdigest(),))
+                        db.delete_session(hashlib.sha256(morsel.value.encode()).hexdigest())
                 self.respond(200, {"ok":True}, {"Set-Cookie":"nuu_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" + ("; Secure" if COOKIE_SECURE else "")})
                 return
             if path == "/api/auth/password":
@@ -575,6 +758,7 @@ class Handler(BaseHTTPRequestHandler):
                     if len(new) < 10 or len(new) > 256:
                         self.respond(400, {"error":"New password must be 10–256 characters."})
                         return
+                    db.begin_write()
                     users = read_table(db, "users")
                     for row in users:
                         if row["id"] == user["id"]:
@@ -592,7 +776,7 @@ class Handler(BaseHTTPRequestHandler):
                     if user.get("must_change_pass"):
                         self.respond(403,{"error":"Change your temporary password first."})
                         return
-                    db.execute("BEGIN IMMEDIATE")
+                    db.begin_write()
                     rows=read_table(db,"audit_logs")
                     rows.append({"id":max([r["id"] for r in rows],default=0)+1,"user_id":user["id"],"action":str(data.get("action",""))[:80],"module":str(data.get("module",""))[:80],"target_id":data.get("target_id"),"detail":str(data.get("detail",""))[:500],"created_at":datetime.now(timezone.utc).isoformat()})
                     write_table(db,"audit_logs",rows[-10000:])
@@ -607,7 +791,7 @@ class Handler(BaseHTTPRequestHandler):
                     if user.get("must_change_pass") or user.get("role_slug")!="student":
                         self.respond(403,{"error":"Only an active student can submit assignment work."})
                         return
-                    db.execute("BEGIN IMMEDIATE")
+                    db.begin_write()
                     student=next((s for s in read_table(db,"students") if s.get("user_id")==user["id"] and s.get("status")=="active"),None)
                     try:
                         assignment_id=int(data.get("assignment_id"))
@@ -636,8 +820,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.respond(409,{"error":"A submission already exists for this assignment."})
                         return
                     mime=mimetypes.guess_type(filename)[0] or "application/octet-stream"
-                    cursor=db.execute("INSERT INTO uploads(owner_id,assignment_id,filename,media_type,content,created_at) VALUES(?,?,?,?,?,?) RETURNING id",(user["id"],assignment_id,filename,mime,content,datetime.now(timezone.utc).isoformat()))
-                    uploads_id=cursor.fetchone()["id"]
+                    uploads_id=db.create_upload(user["id"],assignment_id,filename,mime,content,datetime.now(timezone.utc).isoformat())
                     rows=read_table(db,"submissions")
                     row={"id":max([r["id"] for r in rows],default=0)+1,"assignment_id":assignment_id,"student_id":student["id"],"upload_id":uploads_id,"file_name":filename,"comments":str(data.get("comments",""))[:1000],"submitted_at":datetime.now(timezone.utc).isoformat()}
                     rows.append(row)
@@ -653,7 +836,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.respond(401,{"error":"Sign in before admitting a student."});return
                     if user.get("must_change_pass") or user["role_slug"] not in {"admin","registrar"}:
                         self.respond(403,{"error":"Only an administrator or registrar can admit students."});return
-                    db.execute("BEGIN IMMEDIATE")
+                    db.begin_write()
                     fn=str(data.get("fn"," ")).strip()[:80]
                     ln=str(data.get("ln"," ")).strip()[:80]
                     try:
@@ -680,10 +863,9 @@ class Handler(BaseHTTPRequestHandler):
                         program=next((p for p in read_table(db,"programs") if p.get("dept_id")==dept_id and p.get("name")==selected_program),None)
                         if not dept or not program:
                             self.respond(409,{"error":"The reviewed programme is no longer available."});return
-                    sequence=db.execute("SELECT last_number FROM student_sequences WHERE department_id=?",(dept_id,)).fetchone()
                     existing_numbers=[int(re.search(r"(\d+)$",str(s.get("student_number",""))).group(1)) for s in read_table(db,"students") if s.get("dept_id")==dept_id and re.search(r"(\d+)$",str(s.get("student_number","")))]
-                    number=max(max(existing_numbers,default=0),sequence["last_number"] if sequence else 0)+1
-                    db.execute("INSERT INTO student_sequences(department_id,last_number) VALUES(?,?) ON CONFLICT(department_id) DO UPDATE SET last_number=excluded.last_number",(dept_id,number))
+                    number=max(max(existing_numbers,default=0),db.get_student_sequence(dept_id))+1
+                    db.set_student_sequence(dept_id,number)
                     student_number=f"ACMS{datetime.now(timezone.utc).year}-{dept['code']}-{number:03d}"
                     settings=next(iter(read_table(db,"settings")),{})
                     email_domain=str(settings.get("email_domain","acms.ac.ug"))
@@ -741,7 +923,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.respond(400,{"error":"Academic credential files must total 8 MB or less."});return
                     decoded_credentials.append((filename,content,mimetypes.guess_type(filename)[0] or "application/octet-stream"))
                 with connect() as db:
-                    db.execute("BEGIN IMMEDIATE")
+                    db.begin_write()
                     rows = read_table(db,"applications")
                     row = {"id":max([r["id"] for r in rows],default=0)+1,"created_at":datetime.now(timezone.utc).isoformat(),"status":"pending","review_status":"pending_review","documents":[],**{k:str(data[k]).strip() for k in required if k not in {"dept_id"}}}
                     try:
@@ -756,8 +938,8 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     for filename,content,media_type in decoded_credentials:
                         uploaded=datetime.now(timezone.utc).isoformat()
-                        cursor=db.execute("INSERT INTO application_documents(application_id,filename,media_type,content,created_at) VALUES(?,?,?,?,?) RETURNING id",(row["id"],filename,media_type,content,uploaded))
-                        row["documents"].append({"id":cursor.fetchone()["id"],"filename":filename,"uploaded_at":uploaded})
+                        document_id=db.create_application_document(row["id"],filename,media_type,content,uploaded)
+                        row["documents"].append({"id":document_id,"filename":filename,"uploaded_at":uploaded})
                     rows.append(row)
                     write_table(db,"applications",rows)
                 self.respond(201,{"id":row["id"]})
@@ -814,7 +996,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(401,{"error":"Sign in before reviewing applications."});return
             if user.get("must_change_pass") or user.get("role_slug") not in {"admin","registrar"}:
                 self.respond(403,{"error":"Only administrators and registrars can review applications."});return
-            db.execute("BEGIN IMMEDIATE")
+            db.begin_write()
             applications=read_table(db,"applications")
             application=next((row for row in applications if row.get("id")==application_id),None)
             if not application:
@@ -886,7 +1068,7 @@ class Handler(BaseHTTPRequestHandler):
             user=self.mutation_user(db,name)
             if not user:return
             role=user["role_slug"]
-            db.execute("BEGIN IMMEDIATE")
+            db.begin_write()
             rows=read_table(db,name)
             row=dict(payload)
             row.pop("id",None); row.pop("created_at",None); row.pop("updated_at",None)
@@ -986,7 +1168,7 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as db:
             user=self.mutation_user(db,name)
             if not user:return
-            db.execute("BEGIN IMMEDIATE")
+            db.begin_write()
             rows=read_table(db,name)
             index=next((i for i,row in enumerate(rows) if row.get("id")==record_id),None)
             if index is None:
@@ -1021,7 +1203,7 @@ class Handler(BaseHTTPRequestHandler):
                 if len(password)<10:
                     self.respond(400,{"error":"Passwords must be at least 10 characters."});return
                 updates={**updates,"password":password_hash(password),"must_change_pass":True}
-                db.execute("DELETE FROM sessions WHERE user_id=?",(record_id,))
+                db.delete_sessions_for_user(record_id)
             if name=="registrations" and role=="student":
                 self.respond(403,{"error":"Students cannot directly alter registration decisions."});return
             if name=="fee_payments" and role=="finance" and (set(updates)!={"status"} or updates.get("status")!="reversed"):
@@ -1048,7 +1230,7 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as db:
             user=self.mutation_user(db,name)
             if not user:return
-            db.execute("BEGIN IMMEDIATE")
+            db.begin_write()
             rows=read_table(db,name)
             target=next((row for row in rows if row.get("id")==record_id),None)
             if not target:
@@ -1073,9 +1255,10 @@ class Handler(BaseHTTPRequestHandler):
                 if referenced:
                     self.respond(409,{"error":"This department is in use. Reassign or remove its linked users, students, applications, programs, and courses before deleting it."});return
             write_table(db,name,[row for row in rows if row.get("id")!=record_id])
-            if name=="departments":db.execute("DELETE FROM student_sequences WHERE department_id=?",(record_id,))
-            if name=="users":db.execute("DELETE FROM sessions WHERE user_id=?",(record_id,))
-            if name=="applications":db.execute("DELETE FROM application_documents WHERE application_id=?",(record_id,))
+            if name=="departments":db.delete_student_sequence(record_id)
+            if name=="users":db.delete_sessions_for_user(record_id)
+            if name=="applications":
+                db.delete_application_documents(record_id)
         self.respond(200,{"deleted":record_id})
 
     def table_write(self, name, rows):
@@ -1102,7 +1285,7 @@ class Handler(BaseHTTPRequestHandler):
             if name not in WRITE_ROLES.get(role,set()):
                 self.respond(403,{"error":"Your role cannot change this information."})
                 return
-            db.execute("BEGIN IMMEDIATE")
+            db.begin_write()
             existing=read_table(db,name)
             if role == "student":
                 student=next((s for s in read_table(db,"students") if s.get("user_id")==user["id"]),None)
@@ -1178,7 +1361,7 @@ class Handler(BaseHTTPRequestHandler):
                 for row in rows:
                     prior=old.get(row["id"])
                     if prior and prior.get("password") != row.get("password"):
-                        db.execute("DELETE FROM sessions WHERE user_id=?",(row["id"],))
+                        db.delete_sessions_for_user(row["id"])
             if role == "lecturer" and name == "assignments":
                 courses={course["id"] for course in read_table(db,"courses")}
                 old_assignments={row["id"]:row for row in existing}
@@ -1229,7 +1412,8 @@ def main():
     host=os.environ.get("NUU_HOST","127.0.0.1")
     port=int(os.environ.get("PORT",os.environ.get("NUU_PORT","8000")))
     server=ThreadingHTTPServer((host,port),Handler)
-    print(f"ACMS server running at http://{host}:{port} ({'Neon PostgreSQL' if DATABASE_URL else f'SQLite: {DB_PATH}'})")
+    storage="Supabase PostgreSQL" if DATABASE_URL else "volatile in-memory storage"
+    print(f"ACMS server running at http://{host}:{port} ({storage})")
     if bootstrap:
         print(f"Initial admin login — username: {bootstrap['username']}  password: {bootstrap['password']}")
         print("Change this temporary password at first sign-in. Save it securely; it is shown only during initial setup.")

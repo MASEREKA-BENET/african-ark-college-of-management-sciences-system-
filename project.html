@@ -167,8 +167,9 @@ body {
   position: absolute; left: 13px; top: 50%; transform: translateY(-50%);
   font-size: 16px; pointer-events: none;
 }
+.finput-icon { display: none; }
 .finput-wrap input, .finput-wrap select {
-  width: 100%; padding: 11px 14px 11px 40px;
+  width: 100%; padding: 11px 14px;
   border: 1.5px solid var(--g200); border-radius: 9px;
   font-size: 14px; font-family: 'Outfit', sans-serif;
   color: var(--g900); background: #fafafa; transition: var(--tr);
@@ -260,6 +261,7 @@ body {
   width: 3px; background: var(--amber-lt); border-radius: 0 3px 3px 0;
 }
 .sb-icon { width: 20px; text-align: center; font-size: 15px; flex-shrink: 0; }
+.sb-icon { display: none; }
 .sb-badge {
   margin-left: auto; background: var(--red);
   color: white; font-size: 10px; font-weight: 700;
@@ -325,12 +327,13 @@ body {
   display: flex; align-items: center; justify-content: center;
   font-size: 22px; flex-shrink: 0;
 }
+.stat-icon, .user-role-icon, .empty-state .ei { display: none !important; }
 .stat-val   { font-size: 26px; font-weight: 800; color: var(--navy); line-height: 1; }
 .stat-label { font-size: 11px; color: var(--g400); margin-top: 2px; text-transform: uppercase; letter-spacing: .5px; }
 .user-role-card {
   min-width: 0;
   display: grid;
-  grid-template-columns: 28px 28px minmax(0, 1fr);
+  grid-template-columns: 28px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
   padding: 14px 16px;
@@ -729,17 +732,17 @@ input, select, textarea, button { max-width: 100%; }
         <div class="finput-wrap">
           <span class="finput-icon">🔑</span>
           <input id="lp" type="password" placeholder="Enter password" required autocomplete="current-password" style="padding-right: 40px;">
-          <button type="button" class="pwd-toggle" onclick="togglePassword('lp', this)">👁️</button>
+      <button type="button" class="pwd-toggle" onclick="togglePassword('lp', this)" aria-label="Show password">Show</button>
         </div>
       </div>
-      <button class="btn-login" type="submit">🔐 Sign In</button>
+      <button class="btn-login" type="submit">Sign In</button>
     </form>
     <p style="font-size:11px;color:var(--g400);text-align:center;margin-top:20px;">
       First time? Admin logs in first and creates all other users.
     </p>
     <div style="text-align:center; margin-top:20px;">
       <p style="font-size:12px;color:var(--g700);margin-bottom:8px;">New Student?</p>
-      <button type="button" class="btn btn-outline btn-blk" onclick="show('applyScreen')">📝 Apply Online Here</button>
+      <button type="button" class="btn btn-outline btn-blk" onclick="show('applyScreen')">Apply Online Here</button>
     </div>
   </div>
 </div>
@@ -850,8 +853,8 @@ input, select, textarea, button { max-width: 100%; }
 
 <script>
 // ╔══════════════════════════════════════════════════════════════╗
-// ║               NUU UMS — DATABASE ENGINE                      ║
-// ║  Simulated SQL tables in localStorage                        ║
+// ║               NUU UMS — DATA API                              ║
+// ║  Server-owned data is held in memory for this process         ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 // ─── MOBILE RESPONSIVENESS ─────────────────────────────────────
@@ -898,6 +901,44 @@ const DB = {
   where: (table, pred) => DB.get(table).filter(pred),
   count: (table, pred) => pred ? DB.get(table).filter(pred).length : DB.get(table).length,
 };
+
+const DECORATIVE_ICON_RE = /[\u{1F000}-\u{1FAFF}\u{1F1E6}-\u{1F1FF}\u{2600}-\u{27BF}\u{2300}-\u{23FF}\u{2B00}-\u{2BFF}\uFE0E\uFE0F\u200D]/gu;
+function iconOnlyButtonLabel(button) {
+  const supplied=button.getAttribute('aria-label')||button.title;
+  if(supplied)return supplied;
+  const action=(button.getAttribute('onclick')||'').toLowerCase();
+  if(/edit|update/.test(action))return 'Edit';
+  if(/delete|remove/.test(action))return 'Delete';
+  if(/reset.*pass|password/.test(action))return 'Reset';
+  if(/toggle.*status|status/.test(action))return 'Status';
+  if(/view/.test(action))return 'View';
+  if(/close/.test(action))return 'Close';
+  if(/approve/.test(action))return 'Approve';
+  if(/reject/.test(action))return 'Reject';
+  return 'Action';
+}
+
+function removeDecorativeIcons(root=document.body) {
+  if(root?.nodeType===Node.TEXT_NODE)root=root.parentElement;
+  if(!root)return;
+  const selector='button,.btn,.finput-icon,.sb-icon,.login-badge,.stat-icon,.user-role-icon,.card-title,.modal-title,.badge,.alert,.empty-state .ei,.feat-chip,h1,h2,h3,h4';
+  const elements=[];
+  if(root.matches?.(selector))elements.push(root);
+  if(root.querySelectorAll)elements.push(...root.querySelectorAll(selector));
+  elements.forEach(element=>{
+    const original=element.textContent||'';
+    const cleaned=original.replace(DECORATIVE_ICON_RE,'').replace(/\s+/gu,' ').trim();
+    if(cleaned!==original.trim()){
+      const replacement=element.matches('button')&&!cleaned?iconOnlyButtonLabel(element):cleaned;
+      element.textContent=replacement;
+      if(element.matches('button')&&!element.hasAttribute('aria-label'))element.setAttribute('aria-label',replacement);
+    }
+  });
+}
+
+removeDecorativeIcons(document.body);
+new MutationObserver(records=>records.forEach(record=>record.addedNodes.forEach(removeDecorativeIcons)))
+  .observe(document.body,{childList:true,subtree:true});
 
 // ─── AUDIT LOG ─────────────────────────────────────────────────
 function auditLog(userId, action, module, targetId, detail) {
@@ -1290,7 +1331,8 @@ function togglePassword(inputId, btn) {
   if (!input) return;
   const isPassword = input.type === 'password';
   input.type = isPassword ? 'text' : 'password';
-  btn.textContent = isPassword ? '🙈' : '👁️';
+  btn.textContent = isPassword ? 'Hide' : 'Show';
+  btn.setAttribute('aria-label', isPassword ? 'Hide password' : 'Show password');
 }
 
 // ─── DARK MODE ──────────────────────────────────────────────────
@@ -1833,7 +1875,7 @@ function openCreateUserModal() {
     <div class="form-group"><label class="form-label">Password <span class="req">*</span></label>
       <div style="position: relative;">
         <input type="password" class="form-control" id="cu_pass" required minlength="10" placeholder="min 10 characters" style="padding-right: 36px;">
-        <button type="button" class="pwd-toggle" onclick="togglePassword('cu_pass', this)" style="right: 8px;">👁️</button>
+    <button type="button" class="pwd-toggle" onclick="togglePassword('cu_pass', this)" aria-label="Show password" style="right: 8px;">Show</button>
       </div></div>
     <div class="form-group" style="grid-column:1/-1;">
       <div class="form-hint">Users must set a new password on their first sign-in.</div></div>
@@ -2376,6 +2418,13 @@ pages.results = () => {
   const approved = results.filter(r=>r.status==='approved');
 
   return `
+  ${canApprove?`<div class="flex justify-between items-center mb-4" style="gap:12px;flex-wrap:wrap;">
+    <p class="text-sm text-muted">Download the full academic results register (${results.length} records).</p>
+    <div class="flex gap-2" style="flex-wrap:wrap;">
+      <button class="btn btn-outline" onclick="exportResultsExcel()">📊 Download Excel</button>
+      <button class="btn btn-outline" onclick="printResultsPDF()">🖨️ Print / Save PDF</button>
+    </div>
+  </div>`:''}
   <div class="tabs">
     <button class="tab-btn active" onclick="switchTab(event,'rp')">⏳ Pending (${pending.length})</button>
     <button class="tab-btn" onclick="switchTab(event,'ra')">✅ Approved (${approved.length})</button>
@@ -2410,6 +2459,34 @@ pages.results = () => {
     </div>
   </div>`).join('')}`;
 };
+
+async function exportResultsExcel() {
+  if (!['admin','registrar'].includes(currentUser?.role_slug)) return;
+  try {
+    const response=await fetch('/api/exports/results.xlsx');
+    if(!response.ok){let message='Could not export academic results.';try{message=(await response.json()).error||message;}catch(_){}throw new Error(message);}
+    const url=URL.createObjectURL(await response.blob());
+    const link=document.createElement('a');link.href=url;link.download='acms_academic_results.xlsx';link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }catch(error){showAlert(error.message||'Could not export academic results.','error');}
+}
+
+function printResultsPDF() {
+  if (!['admin','registrar'].includes(currentUser?.role_slug)) return;
+  const results=DB.get('results');
+  const escapeText=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const rows=results.map(result=>{
+    const student=DB.find('students',item=>item.id==result.student_id);
+    const user=DB.find('users',item=>item.id==student?.user_id);
+    const course=DB.find('courses',item=>item.id==result.course_id);
+    return `<tr><td>${escapeText(formatStudentNumber(student?.student_number))}</td><td>${escapeText(user?.full_name||'—')}</td><td>${escapeText(getDeptName(student?.dept_id))}</td><td>${escapeText(student?.programme||'—')}</td><td>${escapeText(course?.code||'—')}</td><td>${escapeText(course?.name||'—')}</td><td>${Number(result.coursework||0)}</td><td>${Number(result.exam||0)}</td><td>${Number(result.coursework||0)+Number(result.exam||0)}</td><td>${escapeText(result.grade||'—')}</td><td>${escapeText(result.grade_points??'—')}</td><td>${escapeText(result.status||'—')}</td></tr>`;
+  }).join('');
+  const printWindow=window.open('','_blank');
+  if(!printWindow){showAlert('Allow pop-ups to print or save results as PDF.','error');return;}
+  printWindow.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>ACMS Academic Results</title><style>@page{size:landscape;margin:12mm}body{font:11px Arial,sans-serif;color:#172337}h1{font-size:20px}p{color:#596579}table{width:100%;border-collapse:collapse;margin-top:16px}th,td{border:1px solid #cbd2dc;padding:6px;text-align:left}th{background:#eef2f7;font-size:9px;text-transform:uppercase}tr{break-inside:avoid}</style></head><body><h1>Academic Results Register</h1><p>African Ark College of Management Sciences · ${results.length} records · ${new Date().toLocaleDateString()}</p><table><thead><tr><th>Student Number</th><th>Student Name</th><th>Department</th><th>Programme</th><th>Course Code</th><th>Course</th><th>Coursework</th><th>Exam</th><th>Total</th><th>Grade</th><th>Grade Points</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></body></html>`);
+  printWindow.document.close();
+  printWindow.onload=()=>{printWindow.focus();printWindow.print();};
+}
 
 // ─── FEE PAYMENTS ──────────────────────────────────────────────
 window.exportFinanceCSV = () => {
