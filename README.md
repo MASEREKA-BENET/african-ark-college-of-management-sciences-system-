@@ -26,7 +26,7 @@ Put the full Neon PostgreSQL connection string in `.env`, including `sslmode=req
    - `NUU_COOKIE_SECURE`: `1`.
    - `NUU_ALLOWED_ORIGINS`: the exact public Vercel origin, such as `https://your-project.vercel.app`; add custom domains as comma-separated origins.
    - `NEON_AUTH_BASE_URL` and `NEON_AUTH_JWKS_URL`: copy the values from the local `.env` after `neon deploy` or `neon env pull`.
-3. Keep the Vercel project root at the repository root and deploy. `vercel.json` builds the static frontend and routes `/api/*` to the Python Function in `api/router.py`. `requirements.txt` installs the PostgreSQL driver and local `.env` loader.
+3. Keep the Vercel project root at the repository root and deploy. The `vercel.json` build command installs Node build dependencies before bundling the static frontend, then routes `/api/*` to the Python Function in `api/router.py`. `requirements.txt` installs the PostgreSQL driver and local `.env` loader.
 4. Add the deployed Vercel origin as a trusted domain in Neon Auth. Visit `/api/health` and confirm it reports `"storage":"postgresql"` and `"persistent":true`. Sign in with an email that has an active application role, then verify records persist after a new deployment.
 
 The API creates `app_tables`, `sessions`, `uploads`, `application_documents`, and `student_sequences` in Neon when it starts. Application records are currently stored as JSON rows in `app_tables`; session and uploaded-file data use separate PostgreSQL tables. The backend enforces role and student-scope checks. Do not put database credentials in `project.html` or commit them to Git.

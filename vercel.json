@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "buildCommand": "node deploy/build-vercel.mjs",
+  "buildCommand": "npm ci --include=dev && node deploy/build-vercel.mjs",
   "outputDirectory": "dist",
   "rewrites": [
     {
